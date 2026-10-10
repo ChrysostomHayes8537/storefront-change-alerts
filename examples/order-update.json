@@ -1,0 +1,18 @@
+{
+  "page_url": "https://shop.example.com/orders/A1007",
+  "alert_to": "editor@example.com",
+  "checkout": {
+    "order_id": "A1007",
+    "currency": "USD",
+    "total_minor": 12900
+  },
+  "fulfillment": {
+    "status": "packing",
+    "carrier": null,
+    "tracking_reference": null
+  },
+  "receipt": {
+    "receipt_number": "R-2026-1007",
+    "issued_at": "2026-09-25T09:30:00Z"
+  }
+}
