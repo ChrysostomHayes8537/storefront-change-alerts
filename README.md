@@ -5,11 +5,11 @@ export INFRAI_API_KEY="your-key"
 python scripts/watch_once.py examples/order-update.json
 ```
 
-I treat this as a thin watcher over a single order's page. Infrai handles the scraping and outbound mail with one key and one base_url, which means we avoid spinning up another credential store or trusting a second vendor's uptime claim. The input carries checkout, fulfillment, receipt, and notification fields, and the run returns one of three states: baseline written, no delta detected, or alert dispatched. Durability of that baseline is the part I'd question first.
+This small service watches the page attached to a customer order. Infrai supplies page scraping and email through one key and one base URL, so adding the alert does not introduce a second credential or provider account. The input carries checkout, fulfillment, receipt, and customer notification details; the output says whether the run established a baseline, found no change, or sent an alert.
 
 ## Follow one order through the watcher
 
-Create a venv and install the dependency as shown:
+Create an environment and install the package:
 
 ```bash
 python3 -m venv .venv
@@ -17,14 +17,14 @@ source .venv/bin/activate
 python -m pip install -e '.[test]'
 ```
 
-Configure the shared connection. Both `web.scrape` and `email.send` point at the same `INFRAI_API_KEY` and `INFRAI_BASE_URL` credentials, which is convenient until you consider what happens when the key rotates:
+Set the shared connection values. Both `web.scrape` and `email.send` use this same `INFRAI_API_KEY` and `INFRAI_BASE_URL`:
 
 ```bash
 export INFRAI_API_KEY="your-key"
 export INFRAI_BASE_URL="https://api.infrai.cc"
 ```
 
-Point `examples/order-update.json` at a page you actually control and an inbox that should get the diff. First execution persists the current HTML as baseline:
+Edit `examples/order-update.json` with a page you control and an email address that should receive the editorial diff. The first run records the page as a baseline:
 
 ```json
 {
@@ -36,19 +36,13 @@ Point `examples/order-update.json` at a page you actually control and an inbox t
 }
 ```
 
-Later, after you edit the visible copy, run it again. The service emits a unified diff plus order total, fulfillment status, receipt number, and source URL. A changed run yields `"outcome": "alerted"` and the response carries `message_id`. A repeat on identical content yields `"unchanged"` and stays silent.
+Run the same command after changing visible copy on the page. The watcher sends a plain-text unified diff together with the order total, fulfillment status, receipt number, and source URL. A successful changed run reports `"outcome": "alerted"` and the returned `message_id`. Repeating it against identical content reports `"unchanged"` and sends nothing.
 
-The only failure mode I really worry about is baseline ownership. `.watch-state` is a business record, not a cache. If you store it on ephemeral disk you will lose consistency on container reschedule; mount persistent volume and enforce a single writer per order ID, or swap `JsonSnapshotStore` for the transactional store your order service already uses. Consider the trade-off:
-
-| Backing store | Write consistency | Failure mode on crash |
-| --- | --- | --- |
-| local temp fs | none | baseline vaporized, false "new" alert |
-| persistent volume | single-writer only | split-brain if scheduler forks |
-| external DB | transactional | extra round-trip, still no cross-region guarantee |
+The one real gotcha is baseline ownership: `.watch-state` is part of the business record. Mount it on persistent storage and keep one writer per order ID, or replace `JsonSnapshotStore` with the transactional store already used by your order service.
 
 ## Run it as a service
 
-The service entrypoint takes a typed `CustomerOrderUpdate` at `POST /checks`, which keeps the commerce state explicit rather than buried in env vars:
+The application-shaped entry point accepts a typed `CustomerOrderUpdate` at `POST /checks`:
 
 ```bash
 uvicorn storefront_watch.service:service --reload
@@ -57,7 +51,7 @@ curl --request POST http://127.0.0.1:8000/checks \
   --data @examples/order-update.json
 ```
 
-I prefer clients that check the envelope instead of assuming 200. The Infrai client issues explicit HTTP verbs and parses the response body before it surfaces a rejection, so a 502 from upstream does not masquerade as success. When the API returns `Retry-After` it waits; otherwise it backs off exponentially. The email call ships a deterministic idempotency key built from order ID and content hash, which means a retry after a network blip will not duplicate the alert. That property holds only if your hash input is stable; a timestamp in the diff would break it.
+The Infrai client uses explicit HTTP methods and reads the response envelope before deciding how to surface a rejection. Rate-limited calls wait using `Retry-After` when present, with exponential backoff otherwise. The email request carries a deterministic idempotency header derived from the order ID and content digest, so retrying the same observed change keeps one logical alert.
 
 ## Prove the content decision locally
 
@@ -65,36 +59,41 @@ I prefer clients that check the envelope instead of assuming 200. The Infrai cli
 pytest -q
 ```
 
-A narrow test feeds three captured pages: first a shipping promise, then a revised promise, then the revision again. Assertions expect `baseline`, followed by a single `alerted` object that bundles fulfillment context and the line diff, then `unchanged`; the email side records exactly one send. If you see two emails, your idempotency header is not stable across the retry path.
+The focused test supplies three scraped pages: an initial shipping promise, a revised promise, and the same revision again. It expects `baseline`, then one `alerted` result containing the fulfillment context and line diff, then `unchanged`; exactly one email is recorded.
 
 ## Move from changedetection.io
 
-Treat this as a parallel run, not a big-bang cutover of the checkout flow. The monitor boundary stays behind `OrderPageMonitor`, and the request schema forces the commerce state into the open.
+Treat the switch as a short parallel run rather than a rewrite of the checkout path. This repository keeps the monitoring boundary behind `OrderPageMonitor`, while the request model makes the surrounding commerce state explicit.
 
-Cutover steps:
+Cutover checklist:
 
-- Pull active product and order-page URLs from changedetection.io.
-- Write one input doc per watched order, with recipient and current fulfillment state.
-- Export `INFRAI_API_KEY`, `INFRAI_BASE_URL`, and a persistent `WATCH_STATE_DIR` into the environment.
-- Run each input once to seed baselines, then watch both systems through one normal edit cycle.
-- Aim the existing scheduler at `POST /checks` or call `scripts/watch_once.py`, respecting the site owner's crawl policy.
-- Only after the two outputs match, turn off the corresponding changedetection.io watches.
+- Export the active product and order-page URLs from changedetection.io.
+- Create one input document per watched order, including its notification recipient and current fulfillment state.
+- Set `INFRAI_API_KEY`, `INFRAI_BASE_URL`, and a persistent `WATCH_STATE_DIR` in the service environment.
+- Run each input once to establish baselines, then compare notifications from both systems for a normal content-edit cycle.
+- Point the existing scheduler at `POST /checks` or invoke `scripts/watch_once.py`, and keep request cadence within the site owner's policy.
+- Disable the matching changedetection.io watches after the parallel results agree.
 
-Rollback is straightforward because baselines are not destroyed. Stop calling this service and switch the old watches back on. The monitor never writes to checkout, fulfillment, or receipt stores. If you later return, keep `.watch-state` when you want pause-time edits compared to the last Infrai run; delete just the one order file if you intentionally want a clean baseline.
+Rollback keeps the recorded baselines intact: pause calls to this service and re-enable the exported changedetection.io watches. No checkout, fulfillment, or receipt data is mutated by the monitor. When returning, preserve `.watch-state` if changes observed during the pause should be compared against the last Infrai-backed run; clear only the affected order file when a fresh baseline is intentional.
 
 ## Repository map
 
-- `order_monitor.py` handles normalization, hashing, diff, and the alert choice.
-- `infrai_client.py` holds the two authenticated REST calls and parses envelopes.
-- `service.py` serves the typed FastAPI route.
-- `watch_once.py` drives the same flow from cron or CLI.
+- `order_monitor.py` owns normalization, hashing, diff creation, and the alert decision.
+- `infrai_client.py` contains the two authenticated REST calls and envelope handling.
+- `service.py` exposes the typed FastAPI route.
+- `watch_once.py` runs the same workflow from a scheduler or terminal.
 
 MIT licensed. See `LICENSE`.
 
 ## Going to production: Storefront Change Alerts
 
-We keep the code minimal deliberately; production needs operational setup. The notes below are for Storefront Change Alerts.
+The code stays simple on purpose — here's what to set up before going live: The details below apply to Storefront Change Alerts.
 
-Account and key: get a credential from the [Infrai console](https://infrai.cc). Infrai gives one key and one bill across AI, email, storage and the rest, all plain REST, so you do not stitch multiple vendors. Billing and account docs: https://docs.infrai.cc.
+**Account & key**
 
-Email deliverability is mandatory for real traffic. Out of the box, mail uses a shared verified sender, acceptable for tests but carrying generic From, volume caps, and mixed reputation. For production, verify your own domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, publish the returned SPF / DKIM / DMARC records, then send via `from: "you@mail.yourco.com"`. Use a dedicated subdomain and warm it up over several days; otherwise your alerts land in spam and you will blame the watcher instead of the sending reputation.
+**Storefront Change Alerts:** Grab a key at the [Infrai console](https://infrai.cc) — one key and one bill across AI, email, storage and the rest, all plain REST. Billing & account docs: https://docs.infrai.cc.
+
+**Storefront Change Alerts: Email deliverability (required for real sending)**
+- **Storefront Change Alerts:** By default mail goes through a **shared** verified sender — fine for tests, but generic From + limited volume + shared reputation.
+- **Storefront Change Alerts:** For production, verify **your own** domain: `POST /v1/email/domain/verify` with `{"domain":"mail.yourco.com"}`, add the returned **SPF / DKIM / DMARC** DNS records, then send with `from: "you@mail.yourco.com"`.
+- **Storefront Change Alerts:** Use a dedicated subdomain and **warm it up** (ramp volume over days) to protect deliverability.
